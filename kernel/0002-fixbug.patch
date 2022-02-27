@@ -1,0 +1,24 @@
+From a17f4c0999fdcab9b0c33f42ec841cf2f20cf96e Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Sun, 27 Feb 2022 21:20:55 +0800
+Subject: [PATCH 2/3] fixbug
+
+---
+ include/linux/swap.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 042281a1..ba0876b3 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -415,6 +415,7 @@ extern void si_swapinfo(struct sysinfo *);
+ extern swp_entry_t get_swap_page(void);
+ extern swp_entry_t get_swap_page_of_type(int);
+ extern int get_swap_pages(int n, swp_entry_t swp_entries[]);
++extern int get_hpswap_pages(int n, swp_entry_t swp_entries[]);
+ extern int add_swap_count_continuation(swp_entry_t, gfp_t);
+ extern void swap_shmem_alloc(swp_entry_t);
+ extern int swap_duplicate(swp_entry_t);
+-- 
+2.33.1.windows.1
+

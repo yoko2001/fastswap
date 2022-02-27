@@ -1,0 +1,157 @@
+From 17a6a5d1abb099fb990b95a66cb28e0d2d3fd122 Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Sun, 27 Feb 2022 22:31:34 +0800
+Subject: [PATCH 3/3] bug fix
+
+---
+ include/linux/swap.h |  8 ++++++++
+ mm/page_io.c         | 45 +++++++++++++++++++++++---------------------
+ mm/swap_state.c      |  6 +++---
+ 3 files changed, 35 insertions(+), 24 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index ba0876b3..0244d587 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -252,6 +252,8 @@ struct swap_info_struct {
+ 	struct block_device *bdev;	/* swap device or bdev of swap file */
+ 	struct file *swap_file;		/* seldom referenced */
+ 	unsigned int old_block_size;	/* seldom referenced */
++	struct swap_hp_node first_hp_node;// this is used for build hugepage list
++	struct swap_hp_node * curr_hp_node;
+ #ifdef CONFIG_FRONTSWAP
+ 	unsigned long *frontswap_map;	/* frontswap in-use, one bit per page */
+ 	atomic_t frontswap_pages;	/* frontswap pages in-use counter */
+@@ -357,9 +359,12 @@ extern void kswapd_stop(int nid);
+ extern int swap_readpage(struct page *);
+ extern int swap_readpage_sync(struct page *);
+ extern int swap_writepage(struct page *page, struct writeback_control *wbc);
++extern int swap_writehgpage(struct page *page, struct writeback_control *wbc);
+ extern void end_swap_bio_write(struct bio *bio);
+ extern int __swap_writepage(struct page *page, struct writeback_control *wbc,
+ 	bio_end_io_t end_write_func);
++extern int __swap_writehugepage(struct page *page, struct writeback_control *wbc,
++	bio_end_io_t end_write_func);
+ extern int swap_set_page_dirty(struct page *page);
+ 
+ int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
+@@ -413,9 +418,12 @@ static inline long get_nr_swap_pages(void)
+ 
+ extern void si_swapinfo(struct sysinfo *);
+ extern swp_entry_t get_swap_page(void);
++extern swp_entry_t get_hpswap_page(void);
+ extern swp_entry_t get_swap_page_of_type(int);
+ extern int get_swap_pages(int n, swp_entry_t swp_entries[]);
+ extern int get_hpswap_pages(int n, swp_entry_t swp_entries[]);
++extern int add_page_to_build_hp_slots(struct swap_info_struct *sis, unsigned long start_page,
++		unsigned long nr_pages, sector_t start_block, unsigned blocks_per_page);
+ extern int add_swap_count_continuation(swp_entry_t, gfp_t);
+ extern void swap_shmem_alloc(swp_entry_t);
+ extern int swap_duplicate(swp_entry_t);
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 77162ac0..be675ba8 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -230,26 +230,12 @@ bad_bmap:
+ 	goto out;
+ }
+ 
+-/*
+- * We may have stale swap cache pages in memory: notice
+- * them here and get rid of the unnecessary final write.
+- */
+-int swap_writehgpage(struct page *page, struct writeback_control *wbc)
++static sector_t swap_page_sector(struct page *page)
+ {
+-	int ret = 0;
+-
+-	if (frontswap_store(page) == 0) {
+-		set_page_writeback(page);
+-		unlock_page(page);
+-		end_page_writeback(page);
+-		goto out;
+-	}
+-	ret = __swap_writehugepage(page, wbc, end_swap_bio_write);
+-out:
+-	return ret;
++	return (sector_t)__page_file_index(page) << (PAGE_SHIFT - 9);
+ }
+ 
+-int __swap_writehugepage(struct page *page, struct writeback_control *wbc,
++static int __swap_writehugepage(struct page *page, struct writeback_control *wbc,
+ 		bio_end_io_t end_write_func)
+ {
+ 	struct bio *bio;
+@@ -324,6 +310,26 @@ int __swap_writehugepage(struct page *page, struct writeback_control *wbc,
+ out:
+ 	return ret;
+ }
++/*
++ * We may have stale swap cache pages in memory: notice
++ * them here and get rid of the unnecessary final write.
++ */
++int swap_writehgpage(struct page *page, struct writeback_control *wbc)
++{
++	int ret = 0;
++
++	if (frontswap_store(page) == 0) {
++		set_page_writeback(page);
++		unlock_page(page);
++		end_page_writeback(page);
++		goto out;
++	}
++	ret = __swap_writehugepage(page, wbc, end_swap_bio_write);
++out:
++	return ret;
++}
++
++
+ 
+ /*
+  * We may have stale swap cache pages in memory: notice
+@@ -348,10 +354,7 @@ out:
+ 	return ret;
+ }
+ 
+-static sector_t swap_page_sector(struct page *page)
+-{
+-	return (sector_t)__page_file_index(page) << (PAGE_SHIFT - 9);
+-}
++
+ 
+ int __swap_writepage(struct page *page, struct writeback_control *wbc,
+ 		bio_end_io_t end_write_func)
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index e094bb20..47aa3457 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -220,7 +220,7 @@ int add_to_swap(struct page *page, struct list_head *list)
+ 	}
+ }
+ 
+-int write_and_wait_hpswap(struct page *page, struct writeback_control *wbc){
++int write_and_wait_hpswap(struct page *page, struct writeback_control *wbc, swp_entry_t entry){
+ 	int error;
+ 
+ 	struct address_space *address_space;
+@@ -303,7 +303,7 @@ int add_to_hpswap(struct page *page, struct list_head *list)
+ 		.sync_mode = WB_SYNC_NONE,
+ 	};
+ 
+-	err = write_and_wait_hpswap(page, &wbc);
++	err = write_and_wait_hpswap(page, &wbc, entry);
+ 	//page->private has been set to swap entry, so that we can use it to fill pte
+ 
+ 	if (!err) {
+@@ -650,7 +650,7 @@ int init_hpswap_list(struct swap_info_struct *sis){
+ 	sis->maxhugepages = 0;
+ 	sis->inuse_hugepages = 0;
+ 	struct swap_hp_node* sn;
+-	sn = &sis->first_swap_extent;
++	sn = &sis->first_hp_node;
+ 	list_for_each_entry(sn, &sis->first_hp_node.list, list){
+ 		if (sn->nr_pages >= 512){
+ 			//size is ok
+-- 
+2.33.1.windows.1
+
