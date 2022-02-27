@@ -1,0 +1,1469 @@
+From 220f511d41c70f4c7f9b0244336c43e2713a1293 Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Sun, 27 Feb 2022 02:14:17 +0800
+Subject: [PATCH] add basic design for hugepage swapout
+
+---
+ include/linux/hugetlb.h |   2 +
+ include/linux/swap.h    |  25 +++
+ mm/hugetlb.c            | 115 +++++++++-
+ mm/page_io.c            |  96 ++++++++
+ mm/rmap.c               | 292 ++++++++++++++++++++++++
+ mm/swap_slots.c         |  24 ++
+ mm/swap_state.c         | 117 +++++++++-
+ mm/swapfile.c           | 482 +++++++++++++++++++++++++++++++++++++++-
+ 8 files changed, 1140 insertions(+), 13 deletions(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index b857fc8c..74cb886d 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -318,7 +318,9 @@ struct hstate {
+ 	unsigned long resv_huge_pages;
+ 	unsigned long surplus_huge_pages;
+ 	unsigned long nr_overcommit_huge_pages;
++	unsigned long nr_swp_huge_pages;
+ 	struct list_head hugepage_activelist;
++	struct list_head hugepage_swaplist;	
+ 	struct list_head hugepage_freelists[MAX_NUMNODES];
+ 	unsigned int nr_huge_pages_node[MAX_NUMNODES];
+ 	unsigned int free_huge_pages_node[MAX_NUMNODES];
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index c052b901..042281a1 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -204,6 +204,25 @@ struct swap_cluster_list {
+ 	struct swap_cluster_info tail;
+ };
+ 
++//hugepage map to swapfile's address_space at regular page granularity; alloced continuously
++struct swap_hp_node {
++    struct list_head list;
++	unsigned long flags;	//0 for normal; 2 for tail; 1 for head
++    pgoff_t start_page;
++    pgoff_t nr_pages;
++	sector_t start_block;	//used help determine if two hugepage are put adjacent on disk
++};
++struct swap_hp_list{
++	struct swap_hp_node head;
++	struct swap_hp_node tail;
++};
++
++enum {
++	HPSWP_GOOD   = (1 << 0),		//this hp can use, but doesn't mean it hasn't been referenced
++	HPSWP_USED	= (1 << 1),		//this hp is not being used, cannot swap into it
++	HPSWP_HEAD = (1 << 2),
++	HPSWP_TAIL = (1 << 3),
++};
+ /*
+  * The in-memory structure used to track swap areas.
+  */
+@@ -223,6 +242,10 @@ struct swap_info_struct {
+ 	unsigned int inuse_pages;	/* number of those currently in use */
+ 	unsigned int cluster_next;	/* likely index for next allocation */
+ 	unsigned int cluster_nr;	/* countdown to next cluster search */
++	unsigned int hp_avail;		/* number of available hugepages*/
++	unsigned int maxhugepages;	/* max number of hugepages*/
++	unsigned int inuse_hugepages;  /* used hugepages */
++	struct swap_hp_list hugepages;	/*used for store the hugepage info*/
+ 	struct percpu_cluster __percpu *percpu_cluster; /* per cpu's swap location */
+ 	struct swap_extent *curr_swap_extent;
+ 	struct swap_extent first_swap_extent;
+@@ -348,6 +371,8 @@ int generic_swapfile_activate(struct swap_info_struct *, struct file *,
+ /* One swap address space for each 64M swap space */
+ #define SWAP_ADDRESS_SPACE_SHIFT	14
+ #define SWAP_ADDRESS_SPACE_PAGES	(1 << SWAP_ADDRESS_SPACE_SHIFT)
++#define SWAP_HUGEPAGE_SHIFT			11
++#define SWAP_HUGEPAGE_SIZE			(1 << SWAP_HUGEPAGE_SHIFT)
+ extern struct address_space *swapper_spaces[];
+ #define swap_address_space(entry)			    \
+ 	(&swapper_spaces[swp_type(entry)][swp_offset(entry) \
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index e5828875..bdae555f 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -127,17 +127,20 @@ void hugepage_put_subpool(struct hugepage_subpool *spool)
+  * global pools must be adjusted (upward).  The returned value may
+  * only be different than the passed value (delta) in the case where
+  * a subpool minimum size must be manitained.
++ * spool is mount point's subpool
++ * delta number of hugepages needs for allocation
+  */
+ static long hugepage_subpool_get_pages(struct hugepage_subpool *spool,
+ 				      long delta)
+ {
+ 	long ret = delta;
+-
++	//if spool is empty, some hugetlbfs doesn't use subpool
+ 	if (!spool)
+ 		return ret;
+ 
+ 	spin_lock(&spool->lock);
+ 
++	//check max_hpage, if not -1, indicates max_hpages has been set
+ 	if (spool->max_hpages != -1) {		/* maximum size accounting */
+ 		if ((spool->used_hpages + delta) <= spool->max_hpages)
+ 			spool->used_hpages += delta;
+@@ -149,14 +152,17 @@ static long hugepage_subpool_get_pages(struct hugepage_subpool *spool,
+ 
+ 	/* minimum size accounting */
+ 	if (spool->min_hpages != -1 && spool->rsv_hpages) {
++		//subpool has been set min_hpages, has to resv some page
+ 		if (delta > spool->rsv_hpages) {
++			//not enough
+ 			/*
+ 			 * Asking for more reserves than those already taken on
+ 			 * behalf of subpool.  Return difference.
+ 			 */
+ 			ret = delta - spool->rsv_hpages;
+-			spool->rsv_hpages = 0;
++			spool->rsv_hpages = 0;	//use all rsvpage in subpool
+ 		} else {
++			//enough in subpool
+ 			ret = 0;	/* reserves already accounted for */
+ 			spool->rsv_hpages -= delta;
+ 		}
+@@ -267,7 +273,7 @@ static long region_add(struct resv_map *resv, long f, long t)
+ 	list_for_each_entry(rg, head, link)
+ 		if (f <= rg->to)
+ 			break;
+-
++	//found a usable region
+ 	/*
+ 	 * If no region exists which can be expanded to include the
+ 	 * specified range, the list must have been modified by an
+@@ -276,6 +282,7 @@ static long region_add(struct resv_map *resv, long f, long t)
+ 	 */
+ 	if (&rg->link == head || t < rg->from) {
+ 		VM_BUG_ON(resv->region_cache_count <= 0);
++		//means multiple threads entered this place
+ 
+ 		resv->region_cache_count--;
+ 		nrg = list_first_entry(&resv->region_cache, struct file_region,
+@@ -295,7 +302,9 @@ static long region_add(struct resv_map *resv, long f, long t)
+ 		f = rg->from;
+ 
+ 	/* Check for and consume any regions we now overlap with. */
+-	nrg = rg;
++	nrg = rg;	
++	//if region_chg has been called in advance
++	//then this is the correct anster
+ 	list_for_each_entry_safe(rg, trg, rg->link.prev, link) {
+ 		if (&rg->link == head)
+ 			break;
+@@ -357,7 +366,8 @@ static long region_chg(struct resv_map *resv, long f, long t)
+ 	struct list_head *head = &resv->regions;
+ 	struct file_region *rg, *nrg = NULL;
+ 	long chg = 0;
+-
++	//resv_map's region list, use struct file_region to
++	//describe each region
+ retry:
+ 	spin_lock(&resv->lock);
+ retry_locked:
+@@ -1989,6 +1999,89 @@ static void restore_reserve_on_error(struct hstate *h,
+ 	}
+ }
+ 
++/**
++ * core function
++ * swap out any hugepage (resved or not)
++ * including managing hugepage resource recording
++ * struct page setting
++ * unmapping
++ * setting pte
++ */
++static long hugepage_subpool_swapout_pages(struct hstate *h, 
++					struct vm_area_struct *vma, struct hugepage_subpool *spool)
++{
++	struct page* page;
++	int refcount = -1;
++	spin_lock(&hugetlb_lock);
++
++	list_for_each_entry(page, &h->hugepage_activelist, lru){
++		if (!trylock_page(page))
++			continue;
++		// naive break out method
++		unsigned long vm_flags;
++		refcount = page_referenced(page, 1, NULL, &vm_flags);
++
++		if (refcount){
++			if (referenced_ptes > 1)
++				continue;
++			else{
++				break;
++			}
++		}
++		else{
++			//TODO if this will blow up
++			break;
++		}
++	}
++
++	//find a Page which has not that much ref, straight swapout, ASAP
++
++	if (page && &page->lru != &h->hugepage_activelist){
++		VM_BUG_ON(!PagePrivate(page));`	//assumes all are private page
++		//found a page to swap out
++		list_del(&page->lru)	//delete from activelist
++
++		int ret = add_to_hpswap(page, NULL);	//this will write to swapfile
++		if (ret){
++			VM_BUG_ON(1);
++		}
++		
++		//success write to swapfile
++		/*
++		 * The page is mapped into the page tables of one or more
++		 * processes. Try to unmap it here.
++		 */
++		if (page_mapped(page) && page_mapping(page)){
++			//用hugepage专用的unmap函数
++			ret = try_to_unmap_hugepage(page, TTU_UNMAP);
++			switch (ret)
++			{
++			case SWAP_FAIL:
++			case SWAP_AGAIN:
++			case SWAP_MLOCK:
++			case SWAP_LZFREE:
++				VM_BUG_ON(1);
++				/* code */
++				break;
++			case SWAP_SUCCESS:
++				;
++			}
++		}
++		//TODO anything else?
++		int nid = page_to_nid(page);
++		list_move(&page->lru, &h->hugepage_freelists[nid]);
++		h->free_huge_pages++;
++		h->free_huge_pages_node[nid]++;
++	}
++	else{
++		return SWAP_FAIL;
++	}
++	unlock_page(page);
++	spin_unlock(&hugetlb_lock);
++
++	return ret;
++}
++
+ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 				    unsigned long addr, int avoid_reserve)
+ {
+@@ -2840,9 +2933,11 @@ void __init hugetlb_add_hstate(unsigned int order)
+ 	h->mask = ~((1ULL << (order + PAGE_SHIFT)) - 1);
+ 	h->nr_huge_pages = 0;
+ 	h->free_huge_pages = 0;
++	h->nr_swp_huge_pages = 0;
+ 	for (i = 0; i < MAX_NUMNODES; ++i)
+ 		INIT_LIST_HEAD(&h->hugepage_freelists[i]);
+ 	INIT_LIST_HEAD(&h->hugepage_activelist);
++	INIT_LIST_HEAD(&h->hugepage_swaplist);
+ 	h->next_nid_to_alloc = first_memory_node;
+ 	h->next_nid_to_free = first_memory_node;
+ 	snprintf(h->name, HSTATE_NAME_LEN, "hugepages-%lukB",
+@@ -3650,6 +3745,16 @@ int huge_add_to_page_cache(struct page *page, struct address_space *mapping,
+ 	return 0;
+ }
+ 
++
++/**
++ * mm  -- process's address_space
++ * vma -- process's VMA
++ * mapping swapfile's f_mapping
++ * idx -- address's map to offset in hugetlbfs
++ * address -- faulting address
++ * ptep -- pointer to pte
++ * flags -- flags
++ */
+ static int hugetlb_no_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 			   struct address_space *mapping, pgoff_t idx,
+ 			   unsigned long address, pte_t *ptep, unsigned int flags)
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 40cddf6a..77162ac0 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -206,6 +206,7 @@ int generic_swapfile_activate(struct swap_info_struct *sis,
+ 		 * We found a PAGE_SIZE-length, PAGE_SIZE-aligned run of blocks
+ 		 */
+ 		ret = add_swap_extent(sis, page_no, 1, first_block);
++		if (sis->hp_avail & 0x1) add_page_to_build_hp_slots(sis, page_no, 1, first_block, blocks_per_page);
+ 		if (ret < 0)
+ 			goto out;
+ 		nr_extents += ret;
+@@ -229,6 +230,101 @@ bad_bmap:
+ 	goto out;
+ }
+ 
++/*
++ * We may have stale swap cache pages in memory: notice
++ * them here and get rid of the unnecessary final write.
++ */
++int swap_writehgpage(struct page *page, struct writeback_control *wbc)
++{
++	int ret = 0;
++
++	if (frontswap_store(page) == 0) {
++		set_page_writeback(page);
++		unlock_page(page);
++		end_page_writeback(page);
++		goto out;
++	}
++	ret = __swap_writehugepage(page, wbc, end_swap_bio_write);
++out:
++	return ret;
++}
++
++int __swap_writehugepage(struct page *page, struct writeback_control *wbc,
++		bio_end_io_t end_write_func)
++{
++	struct bio *bio;
++	int ret;
++	struct swap_info_struct *sis = page_swap_info(page);
++
++	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
++	if (sis->flags & SWP_FILE) {
++		struct kiocb kiocb;
++		struct file *swap_file = sis->swap_file;
++		struct address_space *mapping = swap_file->f_mapping;
++		struct bio_vec bv = {
++			.bv_page = page,
++			.bv_len  = PAGE_SIZE * 512,
++			.bv_offset = 0
++		};
++		struct iov_iter from;
++
++		iov_iter_bvec(&from, ITER_BVEC | WRITE, &bv, 1, PAGE_SIZE * 512);
++		init_sync_kiocb(&kiocb, swap_file);
++		kiocb.ki_pos = page_file_offset(page);
++
++		set_page_writeback(page);
++		unlock_page(page);
++		ret = mapping->a_ops->direct_IO(&kiocb, &from);
++		if (ret == PAGE_SIZE * 512) {
++			count_vm_event(PSWPOUT);
++			ret = 0;
++		} else {
++			/*
++			 * In the case of swap-over-nfs, this can be a
++			 * temporary failure if the system has limited
++			 * memory for allocating transmit buffers.
++			 * Mark the page dirty and avoid
++			 * rotate_reclaimable_page but rate-limit the
++			 * messages but do not flag PageError like
++			 * the normal direct-to-bio case as it could
++			 * be temporary.
++			 */
++			set_page_dirty(page);
++			ClearPageReclaim(page);
++			pr_err_ratelimited("Write error on dio swapfile (%llu)\n",
++					   page_file_offset(page));
++		}
++		end_page_writeback(page);
++		return ret;
++	}
++
++	//shouldn't enter this place, only for swapfile
++	pr_err("swap shouldn't use swap sector\n");
++	ret = -ENOMEM;
++	goto out;
++	ret = bdev_write_page(sis->bdev, swap_page_sector(page), page, wbc);
++	if (!ret) {
++		count_vm_event(PSWPOUT);
++		return 0;
++	}
++
++	ret = 0;
++	bio = get_swap_bio(GFP_NOIO, page, end_write_func);
++	if (bio == NULL) {
++		set_page_dirty(page);
++		unlock_page(page);
++		ret = -ENOMEM;
++		goto out;
++	}
++	bio->bi_opf = REQ_OP_WRITE | wbc_to_write_flags(wbc);
++	count_vm_event(PSWPOUT);
++	set_page_writeback(page);
++	unlock_page(page);
++	submit_bio(bio);
++out:
++	return ret;
++}
++
+ /*
+  * We may have stale swap cache pages in memory: notice
+  * them here and get rid of the unnecessary final write.
+diff --git a/mm/rmap.c b/mm/rmap.c
+index f6838015..4701ce8a 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1257,6 +1257,7 @@ void page_remove_rmap(struct page *page, bool compound)
+ 	if (!PageAnon(page))
+ 		return page_remove_file_rmap(page, compound);
+ 
++	//THP only
+ 	if (compound)
+ 		return page_remove_anon_compound_rmap(page);
+ 
+@@ -1461,6 +1462,241 @@ discard:
+ 	return ret;
+ }
+ 
++/*
++ * before using try_to_unmap_one_hugepage on a specific page, its member private
++ * needs to be set to swp_entry of hugepage swapfile slot
++ * this function will try to do the cleaning before setting the PTE of the page 
++ * to swp_entry and close all the rmaps
++ * @arg: enum ttu_flags will be passed to this argument
++ */
++static int try_to_unmap_one_hugepage(struct page *page, struct vm_area_struct *vma,
++		     unsigned long address, void *arg)
++{
++	struct mm_struct *mm = vma->vm_mm;
++	struct page_vma_mapped_walk pvmw = {
++		.page = page,
++		.vma = vma,
++		.address = address,
++	};
++	pte_t pteval;
++	struct page *subpage;
++	int ret = SWAP_AGAIN;
++	struct rmap_private *rp = arg;
++	enum ttu_flags flags = rp->flags;
++
++
++	VM_BUG_ON_PAGE(!PageHuge(page), page);
++	if (!PageHuge(page)){
++		return SWAP_FAIL;
++	}
++
++	//TODO not sure what's this
++	/* munlock has nothing to gain from examining un-locked vmas */
++	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
++		return SWAP_AGAIN;
++
++	if (flags & TTU_SPLIT_HUGE_PMD) {
++		split_huge_pmd_address(vma, address,
++				flags & TTU_MIGRATION, page);
++	}
++
++	while (page_vma_mapped_walk(&pvmw)) {
++		//for hugepage, pvmw->pte will be set; return true if normal
++		//and holds pvmw->ptl
++
++		/*
++		 * MLOCK stuff TODO not support for now
++		 * If the page is mlock()d, we cannot swap it out.
++		 * If it's recently referenced (perhaps page_referenced
++		 * skipped over this mm) then we should reactivate it.
++		 */
++		if (!(flags & TTU_IGNORE_MLOCK)) {
++			if (vma->vm_flags & VM_LOCKED) {
++				/* PTE-mapped THP are never mlocked */
++				if (!PageTransCompound(page)) {
++					/*
++					 * Holding pte lock, we do *not* need
++					 * mmap_sem here
++					 */
++					mlock_vma_page(page);
++				}
++				ret = SWAP_MLOCK;
++				page_vma_mapped_walk_done(&pvmw);
++				break;
++			}
++			if (flags & TTU_MUNLOCK)
++				continue;
++		}
++
++		/* Unexpected PMD-mapped THP? */
++		VM_BUG_ON_PAGE(!pvmw.pte, page);
++
++
++		//page's address - page frame number 
++		//ref: https://lkml.org/lkml/2022/1/31/1331
++		subpage = page - page_to_pfn(page) + pte_pfn(*pvmw.pte);	//for hugepage / regular page they are the same
++		address = pvmw.address;
++
++
++		if (!(flags & TTU_IGNORE_ACCESS)) {
++			if (ptep_clear_flush_young_notify(vma, address,
++						pvmw.pte)) {
++				//if pte ACCESSED is set, clear it, and call pte_update
++
++				//进入这里说明ACCESSED位置被置位了，被访问了，不能SWAP？
++				//TODO 怎么避免SWAP HUGEPAGE在进入该流程前被ACCESSED过？导致pte修改失败
++				VM_BUG_ON_PAGE(1, page);
++				ret = SWAP_FAIL;
++				page_vma_mapped_walk_done(&pvmw);
++				break;
++			}
++		}
++
++		/* Nuke the page table entry. */
++		//x86 do nothing in flush
++		flush_cache_page(vma, address, pte_pfn(*pvmw.pte));
++		if (should_defer_flush(mm, flags)) {
++			/*
++			 * We clear the PTE but do not flush so potentially
++			 * a remote CPU could still be writing to the page.
++			 * If the entry was previously clean then the
++			 * architecture must guarantee that a clear->dirty
++			 * transition on a cached TLB entry is written through
++			 * and traps if the PTE is unmapped.
++			 */
++			//called native_ptep_get_and_clear + pte_update 
++			//returns native_ptep_get_and_clear() 
++			//clears *pvmw.pte, return original number 
++			//pte_update  not sure what inside
++
++			pteval = ptep_get_and_clear(mm, address, pvmw.pte);
++
++			set_tlb_ubc_flush_pending(mm, pte_dirty(pteval));
++		} else {
++			pteval = ptep_clear_flush(vma, address, pvmw.pte);
++		}
++
++		//pvmw.pte is 0 now
++
++		/* Move the dirty bit to the page. Now the pte is gone. */
++		if (pte_dirty(pteval))
++			set_page_dirty(page);
++
++		/* Update high watermark before we lower rss */
++		update_hiwater_rss(mm);
++		//TODO ???
++
++		if (PageHWPoison(page) && !(flags & TTU_IGNORE_HWPOISON)) {
++			if (PageHuge(page)) {
++				int nr = 1 << compound_order(page);
++				hugetlb_count_sub(nr, mm);
++			} else {
++				dec_mm_counter(mm, mm_counter(page));
++			}
++
++			pteval = swp_entry_to_pte(make_hwpoison_entry(subpage));
++			set_pte_at(mm, address, pvmw.pte, pteval);
++		} else if (pte_unused(pteval)) {
++			//x86 doesn't enter
++
++			/*
++			 * The guest indicated that the page content is of no
++			 * interest anymore. Simply discard the pte, vmscan
++			 * will take care of the rest.
++			 */
++			dec_mm_counter(mm, mm_counter(page));
++		} else if (IS_ENABLED(CONFIG_MIGRATION) &&
++				(flags & TTU_MIGRATION)) {
++			//only migrate.c enters this place
++			swp_entry_t entry;
++			pte_t swp_pte;
++			/*
++			 * Store the pfn of the page in a special migration
++			 * pte. do_swap_page() will wait until the migration
++			 * pte is removed and then restart fault handling.
++			 */
++			entry = make_migration_entry(subpage,
++					pte_write(pteval));
++			swp_pte = swp_entry_to_pte(entry);
++			if (pte_soft_dirty(pteval))
++				swp_pte = pte_swp_mksoft_dirty(swp_pte);
++			set_pte_at(mm, address, pvmw.pte, swp_pte);
++		} else if (PageAnon(page)) {
++			//anonymous rmap  stuff
++			//for hugepage, subpage = page
++
++			swp_entry_t entry = { .val = page_private(subpage) };
++			pte_t swp_pte;
++			
++			//DELETE this, we didn't set it yet
++			/*
++			 * Store the swap location in the pte.
++			 * See handle_pte_fault() ...
++			 */
++			//VM_BUG_ON_PAGE(!PageSwapCache(page), page);
++
++			if (!PageDirty(page) && (flags & TTU_LZFREE)) {
++				//TODO might be OK?
++				/* It's a freeable page by MADV_FREE */
++				dec_mm_counter(mm, MM_ANONPAGES);
++				rp->lazyfreed++;
++				goto discard;
++			}
++
++			if (swap_duplicate(entry) < 0) {
++				/*
++				* Increase reference count of swap entry by 1.
++				* Returns 0 for success, or -ENOMEM if a swap_count_continuation is required
++				* but could not be atomically allocated.  Returns 0, just as if it succeeded,
++				* if __swap_duplicate() fails for another reason (-EINVAL or -ENOENT), which
++				* might occur if a page table entry has got corrupted.
++				* 
++				* __swap_duplicate： 
++				* Verify that a swap entry is valid and increment its swap map count.
++				* Returns error code in following case.
++				* - success -> 0
++				* - swp_entry is invalid -> EINVAL
++				* - swp_entry is migration entry -> EINVAL
++				* - swap-cache reference is requested but there is already one. -> EEXIST
++				* - swap-cache reference is requested but the entry is not used. -> ENOENT
++				* - swap-mapped reference requested but needs continued swap count. -> ENOMEM
++				*/
++				set_pte_at(mm, address, pvmw.pte, pteval);
++				ret = SWAP_FAIL;
++				page_vma_mapped_walk_done(&pvmw);
++				break;
++			}
++			//success change swap_map
++			
++			if (list_empty(&mm->mmlist)) {
++				//TODO doens't come in?
++				spin_lock(&mmlist_lock);
++				if (list_empty(&mm->mmlist))
++					list_add(&mm->mmlist, &init_mm.mmlist);
++				spin_unlock(&mmlist_lock);
++			}
++			//change mm's rss_stat
++			dec_mm_counter(mm, MM_ANONPAGES);
++			inc_mm_counter(mm, MM_SWAPENTS);
++			
++			swp_pte = swp_entry_to_pte(entry);
++			if (pte_soft_dirty(pteval))
++				swp_pte = pte_swp_mksoft_dirty(swp_pte);
++
++			//set the pte
++			set_pte_at(mm, address, pvmw.pte, swp_pte);
++		} else
++			dec_mm_counter(mm, mm_counter_file(page));
++discard:
++		//TODO correct?
++		page_remove_rmap(subpage, PageHuge(page));
++		put_page(page);
++		
++		mmu_notifier_invalidate_page(mm, address);
++	}
++	return ret;
++}
++
+ bool is_vma_temporary_stack(struct vm_area_struct *vma)
+ {
+ 	int maybe_stack = vma->vm_flags & (VM_GROWSDOWN | VM_GROWSUP);
+@@ -1538,6 +1774,62 @@ int try_to_unmap(struct page *page, enum ttu_flags flags)
+ 	return ret;
+ }
+ 
++/**
++ * try_to_unmap_hugepage - try to remove all page table mappings to a page
++ * @page: the page to get unmapped
++ * @flags: action and flags
++ *
++ * Tries to remove all the page table entries which are mapping this
++ * page, used in the pageout path.  Caller must hold the page lock.
++ * Return values are:
++ *
++ * SWAP_SUCCESS	- we succeeded in removing all mappings
++ * SWAP_AGAIN	- we missed a mapping, try again later
++ * SWAP_FAIL	- the page is unswappable
++ * SWAP_MLOCK	- page is mlocked.
++ */
++int try_to_unmap_hugepage(struct page *page, enum ttu_flags flags)
++{
++	int ret;
++	struct rmap_private rp = {
++		.flags = flags,
++		.lazyfreed = 0,
++	};
++
++	struct rmap_walk_control rwc = {
++		.rmap_one = try_to_unmap_one_hugepage,
++		.arg = &rp,
++		.done = page_mapcount_is_zero,
++		.anon_lock = page_lock_anon_vma_read,
++	};
++
++	/*
++	 * During exec, a temporary VMA is setup and later moved.
++	 * The VMA is moved under the anon_vma lock but not the
++	 * page tables leading to a race where migration cannot
++	 * find the migration ptes. Rather than increasing the
++	 * locking requirements of exec(), migration skips
++	 * temporary VMAs until after exec() completes.
++	 */
++	//TODO ? migration
++	if ((flags & TTU_MIGRATION) && !PageKsm(page) && PageAnon(page))
++		rwc.invalid_vma = invalid_migration_vma;
++
++	VM_BUG_ON(!PageAnon(page));
++	if (flags & TTU_RMAP_LOCKED)
++		ret = rmap_walk_locked(page, &rwc);
++	else
++		ret = rmap_walk(page, &rwc);
++		//we go this way
++
++	if (ret != SWAP_MLOCK && !page_mapcount(page)) {
++		ret = SWAP_SUCCESS;
++		if (rp.lazyfreed && !PageDirty(page))
++			ret = SWAP_LZFREE;
++	}
++	return ret;
++}
++
+ static int page_not_mapped(struct page *page)
+ {
+ 	return !page_mapped(page);
+diff --git a/mm/swap_slots.c b/mm/swap_slots.c
+index b1ccb58a..ccd6e249 100644
+--- a/mm/swap_slots.c
++++ b/mm/swap_slots.c
+@@ -337,4 +337,28 @@ repeat:
+ 	return entry;
+ }
+ 
++swp_entry_t get_hpswap_page(void)
++{
++	swp_entry_t entry;
++	//struct swap_slots_cache *cache;
++
++	/*
++	 * Preemption is allowed here, because we may sleep
++	 * in refill_swap_slots_cache().  But it is safe, because
++	 * accesses to the per-CPU data structure are protected by the
++	 * mutex cache->alloc_lock.
++	 *
++	 * The alloc path here does not touch cache->slots_ret
++	 * so cache->free_lock is not taken.
++	 */
++
++	//cache = raw_cpu_ptr(&swp_slots);	//not sure WHAT is this?? seems throwable
++
++	entry.val = 0;
++
++	get_hpswap_pages(1, &entry);
++
++	return entry;
++}
++
+ #endif /* CONFIG_SWAP */
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 0d6b4b3f..e094bb20 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -28,7 +28,7 @@
+  * vmscan's shrink_page_list.
+  */
+ static const struct address_space_operations swap_aops = {
+-	.writepage	= swap_writepage,
++	.writepage	= swap_writepage,	//doesn't interact with FS, only touchs swapslot
+ 	.set_page_dirty	= swap_set_page_dirty,
+ #ifdef CONFIG_MIGRATION
+ 	.migratepage	= migrate_page,
+@@ -220,6 +220,104 @@ int add_to_swap(struct page *page, struct list_head *list)
+ 	}
+ }
+ 
++int write_and_wait_hpswap(struct page *page, struct writeback_control *wbc){
++	int error;
++
++	struct address_space *address_space;
++
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(PageSwapCache(page), page);
++	VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
++
++	get_page(page);
++	__SetPageSwapBacked(page);//SetPageSwapCache(page);
++	set_page_private(page, entry.val);
++	address_space = swap_address_space(entry);
++	spin_lock_irq(&address_space->tree_lock);
++	error = radix_tree_insert(&address_space->page_tree,
++				  swp_offset(entry), page);
++	if (likely(!error)) {
++		address_space->nrpages++;
++	}
++	if (unlikely(error)) {
++		/*
++		 * Only the context which have set SWAP_HAS_CACHE flag
++		 * would call add_to_swap_cache().
++		 * So add_to_swap_cache() doesn't returns -EEXIST.
++		 */
++		VM_BUG_ON(error == -EEXIST);
++		set_page_private(page, 0UL);
++		ClearPageSwapCache(page);
++		put_page(page);
++		return error;
++	}	
++	
++	swap_writehgpage(page, &wbc);
++	lock_page(page);
++	wait_on_page_writeback(page);	
++}
++
++/**
++ * add_to_hpswap - allocate swap space for a huge page
++ * @page: page we want to move to swap
++ *
++ * Allocate swap space for the page and add the page to the
++ * swap cache.  Caller needs to hold the page lock.
++ */
++int add_to_hpswap(struct page *page, struct list_head *list)
++{
++	swp_entry_t entry;
++	int err;
++
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(!PageUptodate(page), page);
++
++	entry = get_hpswap_page();
++	if (!entry.val)
++		return 0;
++
++	//I didn't chg this part, doesn't know if this will break the page
++	if (mem_cgroup_try_charge_swap(page, entry)) {
++		//charge fail
++		swapcache_free(entry);
++		return 0;
++	}
++
++	if (unlikely(PageTransHuge(page)))
++		//I guess we'll not enter this
++		if (unlikely(split_huge_page_to_list(page, list))) {
++			swapcache_free(entry);
++			return 0;
++		}
++
++	/*
++	 * Radix-tree node allocations from PF_MEMALLOC contexts could
++	 * completely exhaust the page allocator. __GFP_NOMEMALLOC
++	 * stops emergency reserves from being allocated.
++	 *
++	 * TODO: this could cause a theoretical memory reclaim
++	 * deadlock in the swap out path.
++	 */
++	/*here ,we don't add to swap cache, we add it straight to swapfile*/
++	struct writeback_control wbc = {
++		.sync_mode = WB_SYNC_NONE,
++	};
++
++	err = write_and_wait_hpswap(page, &wbc);
++	//page->private has been set to swap entry, so that we can use it to fill pte
++
++	if (!err) {
++		return 1;
++	} else {	/* -ENOMEM radix-tree allocation failure */
++		/*
++		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
++		 * clear SWAP_HAS_CACHE flag.
++		 */
++		swapcache_free(entry);
++		return 0;
++	}
++}
++
+ /*
+  * This must be called only on pages that have
+  * been verified to be in the swap cache and locked.
+@@ -548,6 +646,23 @@ skip:
+ 	frontswap_poll_load(cpu);
+ 	return faultpage;
+ }
++int init_hpswap_list(struct swap_info_struct *sis){
++	sis->maxhugepages = 0;
++	sis->inuse_hugepages = 0;
++	struct swap_hp_node* sn;
++	sn = &sis->first_swap_extent;
++	list_for_each_entry(sn, &sis->first_hp_node.list, list){
++		if (sn->nr_pages >= 512){
++			//size is ok
++			sis->maxhugepages++;
++			sn->flags = 0;
++		}
++		else{
++			sn->flags = 123456;	//magic number, indicates sn is not usable, NO USE for now
++		}
++	}
++	return 0;
++}
+ 
+ int init_swap_address_space(unsigned int type, unsigned long nr_pages)
+ {
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 17813088..e90517c9 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -51,6 +51,7 @@ static sector_t map_swap_entry(swp_entry_t, struct block_device**);
+ DEFINE_SPINLOCK(swap_lock);
+ static unsigned int nr_swapfiles;
+ atomic_long_t nr_swap_pages;
++atomic_long_t nr_hpswap_pages;
+ /*
+  * Some modules use swappable objects and may try to swap them out under
+  * memory pressure (via the shrinker). Before doing so, they may wish to
+@@ -766,6 +767,146 @@ no_page:
+ 	return n_ret;
+ }
+ 
++static int scan_hpswap_map_slots(struct swap_info_struct *si,
++			       unsigned char usage, int nr,
++			       swp_entry_t slots[])
++{
++	unsigned long offset = 0;
++	unsigned long last_in_cluster = 0;
++	int latency_ration = LATENCY_LIMIT;
++	int n_ret = 0;
++	if 
++	if (nr > SWAP_BATCH)
++		nr = SWAP_BATCH;
++
++	/*
++	 * We try to cluster swap pages by allocating them sequentially
++	 * in swap.  Once we've allocated SWAPFILE_CLUSTER pages this
++	 * way, however, we resort to first-free allocation, starting
++	 * a new cluster.  This prevents us from scattering swap pages
++	 * all over the entire swap partition, so that we reduce
++	 * overall disk seek times between swap pages.  -- sct
++	 * But we do now try to find an empty cluster.  -Andrea
++	 * And we let swap pages go all over an SSD partition.  Hugh
++	 */
++
++	si->flags += SWP_SCANNING;
++
++	/* SSD algorithm we simply DOESN't SUPPORT*/
++	if (si->cluster_info) {
++		pr_err("scan_hpswap_map_slots doesn't support SSD\n");
++		goto no_page;
++		// if (scan_swap_map_try_ssd_cluster(si, &offset, &scan_base))
++		// 	goto checks;
++		// else
++		// 	goto scan;
++	}
++
++	if (!(si->flags & SWP_WRITEOK))
++		goto no_page;
++checks:
++	// NO SSD
++	// if (si->cluster_info) {
++	// 	while (scan_swap_map_ssd_cluster_conflict(si, offset)) {
++	// 	/* take a break if we already got some slots */
++	// 		if (n_ret)
++	// 			goto done;
++	// 		if (!scan_swap_map_try_ssd_cluster(si, &offset,
++	// 						&scan_base))
++	// 			goto scan;
++	// 	}
++	// }
++	
++	if (!si->highest_bit)
++		goto no_page;
++
++	if (hpnode_list_empty(&si->hugepages)){
++		goto no_page;
++	}
++
++	//we are going to check every hugepages, and found the first free one, get its offset and so on
++	struct swap_hp_node *cur, *nxt;
++	cur = &si->hugepages.head;
++	nxt = list_entry(&cur->list, struct swap_hp_node, list);
++	while(nxt != &si->hugepages.tail){
++		// move backward by one
++		cur = next;
++		next = list_entry(&cur->list, struct swap_hp_node, list);
++
++		//this page has been used, we check the next one
++		if (cur->flags & HPSWP_GOOD && cur->flags & HPSWP_USED)
++			continue;
++
++		offset = cur->start_page;		
++		long of = 0;
++		int found = 1;
++		//check if any page is wrong
++		for (; of < 512; of++){
++			if (si->swap_map[offset + of]) {
++				pr_err("si->swap_map[%d used but flag free\n", offset + of);
++				found = 0;
++				break;
++			}
++		}
++		if (!found)
++			continue;
++foundhp:
++		//we found a continuous space of free regular pages, MARK them as used	
++		for (; of < 512; of++){
++			si->swap_map[offset + of] = usage;
++		}
++		cur->flags |= HPSWP_USED;
++		break;
++	}
++
++	si->inuse_hugepages++;
++	if (si->inuse_hugepages == si->maxhugepages) {
++		//usually it doesn't happen
++		si->lowest_bit = si->max;
++		si->highest_bit = 0;
++		spin_lock(&swap_avail_lock);
++		plist_del(&si->avail_list, &swap_avail_head);
++		spin_unlock(&swap_avail_lock);
++	}
++	
++	//record the entry for the new-found Hugepage
++	slots[n_ret++] = swp_entry(si->type, offset);
++
++	/* got enough slots or reach max slots? */
++	if ((n_ret == nr) || (offset >= si->highest_bit))
++		goto done;
++
++	/* search for next available slot */
++
++	/* time to take a break? */
++	if (unlikely(--latency_ration < 0)) {
++		if (n_ret)
++			goto done;
++		spin_unlock(&si->lock);
++		cond_resched();
++		spin_lock(&si->lock);
++		latency_ration = LATENCY_LIMIT;
++	}
++
++	//NO SSD
++	// /* try to get more slots in cluster */
++	// if (si->cluster_info) {
++	// 	if (scan_swap_map_try_ssd_cluster(si, &offset, &scan_base))
++	// 		goto checks;
++	// 	else
++	// 		goto done;
++	// }
++	/* non-ssd case */
++
++done:
++	si->flags -= SWP_SCANNING;
++	return n_ret;
++
++no_page:
++	si->flags -= SWP_SCANNING;
++	return n_ret;
++}
++
+ static unsigned long scan_swap_map(struct swap_info_struct *si,
+ 				   unsigned char usage)
+ {
+@@ -857,6 +998,88 @@ noswap:
+ 	return n_ret;
+ }
+ 
++/*get n_goal * HUGEPAGESIZE ; swp_entries returns the entrys found*/
++int get_hpswap_pages(int n_goal, swp_entry_t swp_entries[])
++{
++	struct swap_info_struct *si, *next;
++	long avail_pgs;
++	int n_ret = 0;
++
++	avail_pgs = atomic_long_read(&nr_hpswap_pages);
++	if (avail_pgs <= 0)
++		goto noswap;
++
++	if (n_goal > avail_pgs)
++		n_goal = avail_pgs;
++
++	atomic_long_sub(n_goal, &nr_hpswap_pages);
++
++	spin_lock(&swap_avail_lock);
++
++start_over:
++	plist_for_each_entry_safe(si, next, &swap_avail_head, avail_list) {
++		/* requeue si to after same-priority siblings */
++		plist_requeue(&si->avail_list, &swap_avail_head);
++		if (!(si->hp_avail & 0x1)){
++			//we only want page from hp_available swapfile
++			continue;
++		}
++		spin_unlock(&swap_avail_lock);
++		spin_lock(&si->lock);
++		
++		if (!si->highest_bit || !(si->flags & SWP_WRITEOK)) {
++			//highest_bit = 0
++			spin_lock(&swap_avail_lock);
++			if (plist_node_empty(&si->avail_list)) {
++				spin_unlock(&si->lock);
++				goto nextsi;
++			}
++			WARN(!si->highest_bit,
++			     "swap_info %d in list but !highest_bit\n",
++			     si->type);
++			WARN(!(si->flags & SWP_WRITEOK),
++			     "swap_info %d in list but !SWP_WRITEOK\n",
++			     si->type);
++			//this swapinfo got no available pages
++			//so we delete it from swap_avail_head
++			plist_del(&si->avail_list, &swap_avail_head);
++			spin_unlock(&si->lock);
++			goto nextsi;
++		}
++		n_ret = scan_hpswap_map_slots(si, SWAP_HAS_CACHE,
++					    n_goal, swp_entries);
++		spin_unlock(&si->lock);
++		if (n_ret)
++			goto check_out;
++		pr_debug("scan_swap_map of si %d failed to find offset\n",
++			si->type);
++
++		spin_lock(&swap_avail_lock);
++nextsi:
++		/*
++		 * if we got here, it's likely that si was almost full before,
++		 * and since scan_swap_map() can drop the si->lock, multiple
++		 * callers probably all tried to get a page from the same si
++		 * and it filled up before we could get one; or, the si filled
++		 * up between us dropping swap_avail_lock and taking si->lock.
++		 * Since we dropped the swap_avail_lock, the swap_avail_head
++		 * list may have been modified; so if next is still in the
++		 * swap_avail_head list then try it, otherwise start over
++		 * if we have not gotten any slots.
++		 */
++		if (plist_node_empty(&next->avail_list))
++			goto start_over;
++	}
++
++	spin_unlock(&swap_avail_lock);
++
++check_out:
++	if (n_ret < n_goal)
++		atomic_long_add((long) (n_goal-n_ret), &nr_swap_pages);
++noswap:
++	return n_ret;
++}
++
+ /* The only caller of this function is now suspend routine */
+ swp_entry_t get_swap_page_of_type(int type)
+ {
+@@ -2059,7 +2282,7 @@ static int setup_swap_extents(struct swap_info_struct *sis, sector_t *span)
+ 		return ret;
+ 	}
+ 
+-	if (mapping->a_ops->swap_activate) {
++	if (mapping->a_ops->swap_activate) {	//hugeswap doesn't go into this, this is only for nfs
+ 		ret = mapping->a_ops->swap_activate(sis, swap_file, span);
+ 		if (!ret) {
+ 			sis->flags |= SWP_FILE;
+@@ -2068,7 +2291,9 @@ static int setup_swap_extents(struct swap_info_struct *sis, sector_t *span)
+ 		}
+ 		return ret;
+ 	}
+-
++	//huge page go straight into this
++	//this function will walk through each block to collect msg
++	//sis->max; sis->pages; sis->highest_bit will be set in it
+ 	return generic_swapfile_activate(sis, swap_file, span);
+ }
+ 
+@@ -2619,24 +2844,25 @@ static int setup_swap_map_and_extents(struct swap_info_struct *p,
+ 	cluster_list_init(&p->free_clusters);
+ 	cluster_list_init(&p->discard_clusters);
+ 
++	//header is the first page of a swapfile/partition
+ 	for (i = 0; i < swap_header->info.nr_badpages; i++) {
+ 		unsigned int page_nr = swap_header->info.badpages[i];
+ 		if (page_nr == 0 || page_nr > swap_header->info.last_page)
+ 			return -EINVAL;
+ 		if (page_nr < maxpages) {
+-			swap_map[page_nr] = SWAP_MAP_BAD;
++			swap_map[page_nr] = SWAP_MAP_BAD;	//record bad page
+ 			nr_good_pages--;
+ 			/*
+ 			 * Haven't marked the cluster free yet, no list
+ 			 * operation involved
+ 			 */
+-			inc_cluster_info_page(p, cluster_info, page_nr);
++			inc_cluster_info_page(p, cluster_info, page_nr);	//inc refcount && get this page outof freelist
+ 		}
+ 	}
+ 
+ 	/* Haven't marked the cluster free yet, no list operation involved */
+ 	for (i = maxpages; i < round_up(maxpages, SWAPFILE_CLUSTER); i++)
+-		inc_cluster_info_page(p, cluster_info, i);
++		inc_cluster_info_page(p, cluster_info, i);	//inc refcount && get this page outof freelist
+ 
+ 	if (nr_good_pages) {
+ 		swap_map[0] = SWAP_MAP_BAD;
+@@ -2644,7 +2870,7 @@ static int setup_swap_map_and_extents(struct swap_info_struct *p,
+ 		 * Not mark the cluster free yet, no list
+ 		 * operation involved
+ 		 */
+-		inc_cluster_info_page(p, cluster_info, 0);
++		inc_cluster_info_page(p, cluster_info, 0);	//do the same thing for header
+ 		p->max = maxpages;
+ 		p->pages = nr_good_pages;
+ 		nr_extents = setup_swap_extents(p, span);
+@@ -2661,6 +2887,7 @@ static int setup_swap_map_and_extents(struct swap_info_struct *p,
+ 		return nr_extents;
+ 
+ 
++	//SSD stuff
+ 	/*
+ 	 * Reduce false cache line sharing between cluster_info and
+ 	 * sharing same address space.
+@@ -2723,7 +2950,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 	if (IS_ERR(p))
+ 		return PTR_ERR(p);
+ 
+-	INIT_WORK(&p->discard_work, swap_discard_work);
++	INIT_WORK(&p->discard_work, swap_discard_work);	//TODO: what's this
+ 
+ 	name = getname(specialfile);
+ 	if (IS_ERR(name)) {
+@@ -2738,6 +2965,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 		goto bad_swap;
+ 	}
+ 
++	//set address_space
+ 	p->swap_file = swap_file;
+ 	mapping = swap_file->f_mapping;
+ 	inode = mapping->host;
+@@ -2918,6 +3146,246 @@ out:
+ 	return error;
+ }
+ 
++SYSCALL_DEFINE2(hpswapon, const char __user *, specialfile, int, swap_flags)
++{
++	struct swap_info_struct *p;
++	struct filename *name;
++	struct file *swap_file = NULL;
++	struct address_space *mapping;
++	int prio;
++	int error;
++	union swap_header *swap_header;
++	int nr_extents;
++	sector_t span;
++	unsigned long maxpages;
++	unsigned char *swap_map = NULL;
++	struct swap_cluster_info *cluster_info = NULL;
++	unsigned long *frontswap_map = NULL;
++	struct page *page = NULL;
++	struct inode *inode = NULL;
++
++	if (swap_flags & ~SWAP_FLAGS_VALID)
++		return -EINVAL;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	p = alloc_swap_info();
++	if (IS_ERR(p))
++		return PTR_ERR(p);
++
++	p->hp_avail = 1; //pre-set hp_avail, for further use
++	INIT_WORK(&p->discard_work, swap_discard_work);
++
++	name = getname(specialfile);
++	if (IS_ERR(name)) {
++		error = PTR_ERR(name);
++		name = NULL;
++		goto bad_swap;
++	}
++	swap_file = file_open_name(name, O_RDWR|O_LARGEFILE, 0);
++	if (IS_ERR(swap_file)) {
++		error = PTR_ERR(swap_file);
++		swap_file = NULL;
++		goto bad_swap;
++	}
++
++	p->swap_file = swap_file;
++	mapping = swap_file->f_mapping;
++	inode = mapping->host;
++
++	/* If S_ISREG(inode->i_mode) will do inode_lock(inode); */
++	error = claim_swapfile(p, inode);	
++	if (unlikely(error))
++		goto bad_swap;
++
++	/*
++	 * Read the swap header.
++	 */
++	if (!mapping->a_ops->readpage) {
++		error = -EINVAL;
++		goto bad_swap;
++	}
++	page = read_mapping_page(mapping, 0, swap_file);
++	if (IS_ERR(page)) {
++		error = PTR_ERR(page);
++		goto bad_swap;
++	}
++	swap_header = kmap(page);
++
++	maxpages = read_swap_header(p, swap_header, inode);
++	if (unlikely(!maxpages)) {
++		error = -EINVAL;
++		goto bad_swap;
++	}
++
++	/* OK, set up the swap map and apply the bad block list */
++	swap_map = vzalloc(maxpages);
++	if (!swap_map) {
++		error = -ENOMEM;
++		goto bad_swap;
++	}
++
++	if (bdi_cap_stable_pages_required(inode_to_bdi(inode)))
++		p->flags |= SWP_STABLE_WRITES;
++
++	if (p->bdev && blk_queue_nonrot(bdev_get_queue(p->bdev))) {
++		int cpu;
++		unsigned long ci, nr_cluster;
++
++		p->flags |= SWP_SOLIDSTATE;
++		/*
++		 * select a random position to start with to help wear leveling
++		 * some way used for sunhaojunheng, ssd shit
++		 * SSD
++		 */
++		p->cluster_next = 1 + (prandom_u32() % p->highest_bit);	//first page can't use ?
++		nr_cluster = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
++
++		cluster_info = vzalloc(nr_cluster * sizeof(*cluster_info));
++		if (!cluster_info) {
++			error = -ENOMEM;
++			goto bad_swap;
++		}
++
++		for (ci = 0; ci < nr_cluster; ci++)
++			spin_lock_init(&((cluster_info + ci)->lock));
++
++		p->percpu_cluster = alloc_percpu(struct percpu_cluster);
++		if (!p->percpu_cluster) {
++			error = -ENOMEM;
++			goto bad_swap;
++		}
++		for_each_possible_cpu(cpu) {
++			struct percpu_cluster *cluster;
++			cluster = per_cpu_ptr(p->percpu_cluster, cpu);
++			cluster_set_null(&cluster->index);	//data=0 && flag设= NULL
++		}
++	}
++
++	error = swap_cgroup_swapon(p->type, maxpages);
++	if (error)
++		goto bad_swap;
++
++	//set swap_map's badpage; set cluster_info's refcount
++	nr_extents = setup_swap_map_and_extents(p, swap_header, swap_map,
++		cluster_info, maxpages, &span);
++	if (unlikely(nr_extents < 0)) {
++		error = nr_extents;
++		goto bad_swap;
++	}
++
++	/* frontswap enabled? set up bit-per-page map for frontswap */
++	if (IS_ENABLED(CONFIG_FRONTSWAP))
++		frontswap_map = vzalloc(BITS_TO_LONGS(maxpages) * sizeof(long));
++
++	//this deals SWAP_DISCARD, we don't use discard so that we don't care
++	if (p->bdev &&(swap_flags & SWAP_FLAG_DISCARD) && swap_discardable(p)) {
++		/*
++		 * When discard is enabled for swap with no particular
++		 * policy flagged, we set all swap discard flags here in
++		 * order to sustain backward compatibility with older
++		 * swapon(8) releases.
++		 */
++		p->flags |= (SWP_DISCARDABLE | SWP_AREA_DISCARD |
++			     SWP_PAGE_DISCARD);
++
++		/*
++		 * By flagging sys_swapon, a sysadmin can tell us to
++		 * either do single-time area discards only, or to just
++		 * perform discards for released swap page-clusters.
++		 * Now it's time to adjust the p->flags accordingly.
++		 */
++		if (swap_flags & SWAP_FLAG_DISCARD_ONCE)
++			p->flags &= ~SWP_PAGE_DISCARD;
++		else if (swap_flags & SWAP_FLAG_DISCARD_PAGES)
++			p->flags &= ~SWP_AREA_DISCARD;
++
++		/* issue a swapon-time discard if it's still required */
++		if (p->flags & SWP_AREA_DISCARD) {
++			int err = discard_swap(p);
++			if (unlikely(err))
++				pr_err("swapon: discard_swap(%p): %d\n",
++					p, err);
++		}
++	}
++
++	/* One swap address space for each 64M swap space */
++	/* init struct address_space, total nr_pages / 64M address_space*/
++	/* init struct address_space's radix-tree and a_ops = swap_aops, set no writeback*/
++	/*  swap_aops includes swap_writepage and swap_set_page_dirty*/
++	error = init_swap_address_space(p->type, maxpages);
++	if (error)
++		goto bad_swap;
++
++	mutex_lock(&swapon_mutex);
++	prio = -1;
++	if (swap_flags & SWAP_FLAG_PREFER)
++		prio =
++		  (swap_flags & SWAP_FLAG_PRIO_MASK) >> SWAP_FLAG_PRIO_SHIFT;
++	enable_swap_info(p, prio, swap_map, cluster_info, frontswap_map);
++	//set priority, set p's swap_map、cluster_info、frontswap_map
++	//insert p into swap_active_head and swap_avail_head
++
++	/*inuse_hugepages, maxhugepages, hugepages initialization*/
++	error = init_hpswap_list(p);
++	if (error){
++		goto bad_swap;
++	}
++	
++	pr_info("Adding %u [HUGEPAGE]swap on %s.  Priority:%d extents:%d across:%lluk %s%s%s%s%s\n",
++		p->maxhugepages, name->name, p->prio,
++		nr_extents, (unsigned long long)span<<(PAGE_SHIFT-10),
++		(p->flags & SWP_SOLIDSTATE) ? "SS" : "",
++		(p->flags & SWP_DISCARDABLE) ? "D" : "",
++		(p->flags & SWP_AREA_DISCARD) ? "s" : "",
++		(p->flags & SWP_PAGE_DISCARD) ? "c" : "",
++		(frontswap_map) ? "FS" : "");
++
++	mutex_unlock(&swapon_mutex);
++	atomic_inc(&proc_poll_event);
++	wake_up_interruptible(&proc_poll_wait);
++
++	if (S_ISREG(inode->i_mode))
++		inode->i_flags |= S_SWAPFILE;
++	error = 0;
++	goto out;
++bad_swap:
++	free_percpu(p->percpu_cluster);
++	p->percpu_cluster = NULL;
++	if (inode && S_ISBLK(inode->i_mode) && p->bdev) {
++		set_blocksize(p->bdev, p->old_block_size);
++		blkdev_put(p->bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
++	}
++	destroy_swap_extents(p);
++	swap_cgroup_swapoff(p->type);
++	spin_lock(&swap_lock);
++	p->swap_file = NULL;
++	p->flags = 0;
++	spin_unlock(&swap_lock);
++	vfree(swap_map);
++	vfree(cluster_info);
++	if (swap_file) {
++		if (inode && S_ISREG(inode->i_mode)) {
++			inode_unlock(inode);
++			inode = NULL;
++		}
++		filp_close(swap_file, NULL);
++	}
++out:
++	if (page && !IS_ERR(page)) {
++		kunmap(page);
++		put_page(page);
++	}
++	if (name)
++		putname(name);
++	if (inode && S_ISREG(inode->i_mode))
++		inode_unlock(inode);
++	if (!error)
++		enable_swap_slots_cache();
++	return error;
++}
++
+ void si_swapinfo(struct sysinfo *val)
+ {
+ 	unsigned int type;
+-- 
+2.33.1.windows.1
+
