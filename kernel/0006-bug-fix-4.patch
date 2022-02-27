@@ -1,0 +1,49 @@
+From a9d9fd8dabbea08536809ed3bdfde79248dbbaac Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Mon, 28 Feb 2022 00:55:51 +0800
+Subject: [PATCH 6/6] bug fix 4
+
+---
+ mm/swapfile.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index a8d5adc2..323154d8 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -766,8 +766,8 @@ no_page:
+ 	si->flags -= SWP_SCANNING;
+ 	return n_ret;
+ }
+-static bool hpnode_list_empty(struct swap_hp_list shl){
+-	return (shl.head.next) == (&shl.tail);
++static bool hpnode_list_empty(struct swap_hp_list* shl){
++	return (shl->head.list.next) == (&shl->tail.list);
+ }
+ static int scan_hpswap_map_slots(struct swap_info_struct *si,
+ 			       unsigned char usage, int nr,
+@@ -829,7 +829,7 @@ checks:
+ 	//we are going to check every hugepages, and found the first free one, get its offset and so on
+ 	struct swap_hp_node *cur, *nxt;
+ 	cur = &si->hugepages.head;
+-	nxt = list_entry(cur->list.nxt, struct swap_hp_node, list);
++	nxt = list_entry(cur->list.next, struct swap_hp_node, list);
+ 	while(nxt != &si->hugepages.tail){
+ 		// move backward by one
+ 		cur = nxt;
+@@ -840,8 +840,10 @@ checks:
+ 			continue;
+ 
+ 		offset = cur->start_page;		
+-		long of = 0;
+-		int found = 1;
++		long of;
++		int found;
++		of = 0;
++		found = 1;
+ 		//check if any page is wrong
+ 		for (; of < 512; of++){
+ 			if (si->swap_map[offset + of]) {
+-- 
+2.33.1.windows.1
+
