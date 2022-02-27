@@ -1,0 +1,65 @@
+From d11043b33b227fc0aae01368f98ce2fd677b8a12 Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Mon, 28 Feb 2022 01:21:41 +0800
+Subject: [PATCH 7/7] bug fix rmap
+
+---
+ include/linux/rmap.h |  1 +
+ mm/hugetlb.c         | 11 ++++++-----
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 8c89e902..7e23b194 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -196,6 +196,7 @@ int page_referenced(struct page *, int is_locked,
+ #define TTU_ACTION(x) ((x) & TTU_ACTION_MASK)
+ 
+ int try_to_unmap(struct page *, enum ttu_flags flags);
++int try_to_unmap_hugepage(struct page *page, enum ttu_flags flags);
+ 
+ /* Avoid racy checks */
+ #define PVMW_SYNC		(1 << 0)
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index bdae555f..a3f91f15 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -2022,7 +2022,7 @@ static long hugepage_subpool_swapout_pages(struct hstate *h,
+ 		refcount = page_referenced(page, 1, NULL, &vm_flags);
+ 
+ 		if (refcount){
+-			if (referenced_ptes > 1)
++			if (refcount > 1)
+ 				continue;
+ 			else{
+ 				break;
+@@ -2035,13 +2035,13 @@ static long hugepage_subpool_swapout_pages(struct hstate *h,
+ 	}
+ 
+ 	//find a Page which has not that much ref, straight swapout, ASAP
+-
++	int ret; 
+ 	if (page && &page->lru != &h->hugepage_activelist){
+ 		VM_BUG_ON(!PagePrivate(page));`	//assumes all are private page
+ 		//found a page to swap out
+-		list_del(&page->lru)	//delete from activelist
++		list_del(&page->lru);	//delete from activelist
+ 
+-		int ret = add_to_hpswap(page, NULL);	//this will write to swapfile
++		ret = add_to_hpswap(page, NULL);	//this will write to swapfile
+ 		if (ret){
+ 			VM_BUG_ON(1);
+ 		}
+@@ -2068,7 +2068,8 @@ static long hugepage_subpool_swapout_pages(struct hstate *h,
+ 			}
+ 		}
+ 		//TODO anything else?
+-		int nid = page_to_nid(page);
++		int nid;
++		nid = page_to_nid(page);
+ 		list_move(&page->lru, &h->hugepage_freelists[nid]);
+ 		h->free_huge_pages++;
+ 		h->free_huge_pages_node[nid]++;
+-- 
+2.33.1.windows.1
+
