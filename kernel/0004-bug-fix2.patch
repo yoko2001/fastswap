@@ -1,0 +1,43 @@
+From 06d64597ac11d4ddeba7ab182de5de7f2a9957b3 Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Sun, 27 Feb 2022 23:42:49 +0800
+Subject: [PATCH 4/4] bug fix2
+
+---
+ mm/page_io.c    | 2 +-
+ mm/swap_state.c | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page_io.c b/mm/page_io.c
+index be675ba8..f6d9678a 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -235,7 +235,7 @@ static sector_t swap_page_sector(struct page *page)
+ 	return (sector_t)__page_file_index(page) << (PAGE_SHIFT - 9);
+ }
+ 
+-static int __swap_writehugepage(struct page *page, struct writeback_control *wbc,
++int __swap_writehugepage(struct page *page, struct writeback_control *wbc,
+ 		bio_end_io_t end_write_func)
+ {
+ 	struct bio *bio;
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 47aa3457..c7e087fd 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -252,9 +252,11 @@ int write_and_wait_hpswap(struct page *page, struct writeback_control *wbc, swp_
+ 		return error;
+ 	}	
+ 	
+-	swap_writehgpage(page, &wbc);
++	swap_writehgpage(page, wbc);
+ 	lock_page(page);
+ 	wait_on_page_writeback(page);	
++
++	return 0;
+ }
+ 
+ /**
+-- 
+2.33.1.windows.1
+
