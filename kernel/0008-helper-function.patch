@@ -1,0 +1,91 @@
+From 8b09ff48a6e52545d12d0a0cbc8d9f523794df2c Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Mon, 28 Feb 2022 16:28:16 +0800
+Subject: [PATCH 8/8] helper function
+
+---
+ include/linux/swap.h |  1 +
+ mm/swapfile.c        | 55 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 85406048..4cc232f3 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -385,6 +385,7 @@ extern struct address_space *swapper_spaces[];
+ extern unsigned long total_swapcache_pages(void);
+ extern void show_swap_cache_info(void);
+ extern int add_to_swap(struct page *, struct list_head *list);
++extern int add_to_hpswap(struct page *, struct list_head *list);
+ extern int add_to_swap_cache(struct page *, swp_entry_t, gfp_t);
+ extern int __add_to_swap_cache(struct page *page, swp_entry_t entry);
+ extern void __delete_from_swap_cache(struct page *);
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 323154d8..849f01ad 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -2196,6 +2196,61 @@ static void destroy_swap_extents(struct swap_info_struct *sis)
+ 	}
+ }
+ 
++/*
++ * Add a block range (and the corresponding page range) into this hugepage collector
++ * list.  The hp list is kept sorted in page order. (for now)
++ *
++ * This function rather assumes that it is called in ascending page order.
++ * nr_pages here is always one
++ */
++int
++add_page_to_build_hp_slots(struct swap_info_struct *sis, unsigned long start_page,
++		unsigned long nr_pages, sector_t start_block, unsigned  blocks_per_page)
++{
++	struct swap_hp_node *sn;
++	struct swap_hp_node *new_sn;
++	struct list_head *lh;
++
++	if (start_page == 0) {
++		sn = &sis->first_hp_node;
++		sis->curr_hp_node = sn;
++		sn->start_page = 0;
++		sn->nr_pages = nr_pages;
++		if (nr_pages > 512 ) sn->nr_pages = 512;
++		sn->start_block = start_block;
++		return 1;
++	} else {
++		lh = sis->first_hp_node.list.prev;	/* Highest extent */
++		sn = list_entry(lh, struct swap_hp_node, list);	//尾部的那个
++		BUG_ON(sn->start_page + sn->nr_pages != start_page);	
++		if (sn->start_block + sn->nr_pages == start_block) {
++			/* Merge it */
++			sn->nr_pages += nr_pages;
++			if (sn->nr_pages > 512) {
++				nr_pages = sn->nr_pages - 512;
++				sn->nr_pages = 512;
++				start_page = sn->start_page + 512;
++				start_block = sn->start_block + blocks_per_page;
++			}
++			goto nomerge;
++			return 0;
++		}
++	}
++nomerge:
++	/*
++	 * No merge.  Insert a new extent, preserving ordering.
++	 */
++	new_sn = kmalloc(sizeof(*sn), GFP_KERNEL);
++	if (new_sn == NULL)
++		return -ENOMEM;
++	new_sn->start_page = start_page;
++	new_sn->nr_pages = nr_pages;
++	new_sn->start_block = start_block2;
++
++	list_add_tail(&new_sn->list, &sis->first_hp_node.list);
++	return 1;
++}
++
+ /*
+  * Add a block range (and the corresponding page range) into this swapdev's
+  * extent list.  The extent list is kept sorted in page order.
+-- 
+2.33.1.windows.1
+
