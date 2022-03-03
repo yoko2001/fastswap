@@ -1,0 +1,73 @@
+From 9fbea650f43a0c88431dfd2b45a816decbb1faee Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Thu, 3 Mar 2022 17:18:19 +0800
+Subject: [PATCH] add /proc/swaps_write test
+
+---
+ mm/swapfile.c | 48 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 93ac9215..c06b7997 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -2697,8 +2697,56 @@ static int swaps_open(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++static ssize_t swaps_write(struct file *file, const char __user *buf,
++	size_t count, loff_t *ppos)
++{
++	int i, type;
++	char*c, *c2;
++	struct path* p;
++	if (count) {
++		c = kmalloc(count,GFP_KERNEL);
++		c2 = kmalloc(256, GFP_KERNEL);
++		copy_from_user(c,buf,count);
++
++		if (c[0] == 'h' && c[1] == '='){
++			printk('swaps_write: received request for turn ')
++			printk("filename: ");
++			for( i = 2; i < count; i++){
++				printk("%c", c[i]);
++			}
++			printk(" is going to be turn to swapfile\n");
++			for (type = 0; type < nr_swapfiles; type++) {
++				if (!(swap_info[type]->flags & SWP_USED)) 
++					continue;
++				p = swap_info[type]->swap_file->fpath;
++				d_path(p, c2, 256);
++
++				//check if they have the same path
++				if (!strncmp(&c[2], c2, count-2)){
++					printk("found the swapfile to be turned into hugeswap\n");
++					return count;
++				}
++				else {
++					continue;
++				}
++			}	
++		}
++		else{
++			printk("to turn any swapfile to hugeswap: echo h=fileFULLpath\n");
++			goto outswapwrite;
++		}
++	}
++	printk(" \n");
++	return count;
++outswapwrite:
++	kfree(c);
++	kfree(c2);
++	return count;
++}
++
+ static const struct file_operations proc_swaps_operations = {
+ 	.open		= swaps_open,
++	.write      = swaps_write, 
+ 	.read		= seq_read,
+ 	.llseek		= seq_lseek,
+ 	.release	= seq_release,
+-- 
+2.33.1.windows.1
+
