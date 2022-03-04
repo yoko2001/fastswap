@@ -1,0 +1,185 @@
+From dec6179bbc99804d7cbaa442b71dd6e0b20fb4da Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Fri, 4 Mar 2022 18:52:59 +0800
+Subject: [PATCH 1/2] add turn_to_huge_swap
+
+---
+ mm/swapfile.c | 127 ++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 119 insertions(+), 8 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 58149dee..5064d512 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -2704,26 +2704,26 @@ static ssize_t swaps_write(struct file *file, const char __user *buf,
+ 	char*c, *c2;
+ 	struct path* p;
+ 	if (count) {
+-		c = kmalloc(count,GFP_KERNEL);
++		c = kmalloc(count+10,GFP_KERNEL);
+ 		c2 = kmalloc(256, GFP_KERNEL);
+ 		copy_from_user(c,buf,count);
+ 
+ 		if (c[0] == 'h' && c[1] == '='){
+ 			printk('swaps_write: received request for turn ');
+-			printk("filename: ");
+-			for( i = 2; i < count; i++){
+-				printk("%c", c[i]);
+-			}
++			printk("filename: %*.*s", count-2, count-2, &c[2]);
+ 			printk(" is going to be turn to swapfile\n");
+ 			for (type = 0; type < nr_swapfiles; type++) {
+ 				if (!(swap_info[type]->flags & SWP_USED)) 
+ 					continue;
+-				p = swap_info[type]->swap_file->f_path;
++				p = &swap_info[type]->swap_file->f_path;
+ 				d_path(p, c2, 256);
+ 
+ 				//check if they have the same path
+ 				if (!strncmp(&c[2], c2, count-2)){
+ 					printk("found the swapfile to be turned into hugeswap\n");
++
++
++
+ 					return count;
+ 				}
+ 				else {
+@@ -2736,7 +2736,6 @@ static ssize_t swaps_write(struct file *file, const char __user *buf,
+ 			goto outswapwrite;
+ 		}
+ 	}
+-	printk(" \n");
+ 	return count;
+ outswapwrite:
+ 	kfree(c);
+@@ -2755,7 +2754,7 @@ static const struct file_operations proc_swaps_operations = {
+ 
+ static int __init procswaps_init(void)
+ {
+-	proc_create("swaps", 0, NULL, &proc_swaps_operations);
++	proc_create("swaps", S_IRWXU, NULL, &proc_swaps_operations);
+ 	return 0;
+ }
+ __initcall(procswaps_init);
+@@ -3253,6 +3252,118 @@ out:
+ 	return error;
+ }
+ 
++static int turn_swap_to_hpswap(struct swap_info_struct *p, int, swap_flags)
++{
++	struct file *swap_file = NULL;
++	struct address_space *mapping;
++	int prio;
++	int error;
++	sector_t span;
++	unsigned long maxpages;
++	unsigned char *swap_map = NULL;
++	struct swap_cluster_info *cluster_info = NULL;
++	struct page *page = NULL;
++	struct inode *inode = NULL;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	INIT_WORK(&p->discard_work, swap_discard_work);	//TODO: what's this
++
++	//name info is already set
++
++	//swap_file / mapping / inode has been set already
++
++	//no need to claim_swapfile again ?
++	// error = claim_swapfile(p, inode);
++	// if (unlikely(error))
++	// 	goto bad_swap;
++
++	//no need to reread swapheader
++
++	/* OK, set up the swap map and apply the bad block list */
++	// no need to do this
++
++	// no need to do this?
++	// error = swap_cgroup_swapon(p->type, maxpages);
++	// if (error)
++	// 	goto bad_swap;
++
++	// no need to setup swap map & extents again
++
++
++	/* [SKIPPED] frontswap enabled? set up bit-per-page map for frontswap */
++
++	//SKIP DISCARD
++
++	//doesn't need to init address_space again
++
++	mutex_lock(&swapon_mutex);
++	// prio = -1;
++	// if (swap_flags & SWAP_FLAG_PREFER)
++	// 	prio =
++	// 	  (swap_flags & SWAP_FLAG_PRIO_MASK) >> SWAP_FLAG_PRIO_SHIFT;
++	// enable_swap_info(p, prio, swap_map, cluster_info, frontswap_map);
++	/*inuse_hugepages, maxhugepages, hugepages initialization*/
++	error = init_hpswap_list(p);
++	if (error){
++		pr_err("init hpswap error");
++		goto bad_swap;
++	}
++	pr_info("Adding %u [HUGEPAGE]swap on %s.  Priority:%d extents:%d across:%lluk %s%s%s%s%s\n",
++		p->maxhugepages, name->name, p->prio,
++		nr_extents, (unsigned long long)span<<(PAGE_SHIFT-10),
++		(p->flags & SWP_SOLIDSTATE) ? "SS" : "",
++		(p->flags & SWP_DISCARDABLE) ? "D" : "",
++		(p->flags & SWP_AREA_DISCARD) ? "s" : "",
++		(p->flags & SWP_PAGE_DISCARD) ? "c" : "",
++		(frontswap_map) ? "FS" : "");
++
++	mutex_unlock(&swapon_mutex);
++	atomic_inc(&proc_poll_event);
++	wake_up_interruptible(&proc_poll_wait);
++
++	if (S_ISREG(inode->i_mode))
++		inode->i_flags |= S_SWAPFILE;
++	error = 0;
++	goto out;
++bad_swap:
++	free_percpu(p->percpu_cluster);
++	p->percpu_cluster = NULL;
++	if (inode && S_ISBLK(inode->i_mode) && p->bdev) {
++		set_blocksize(p->bdev, p->old_block_size);
++		blkdev_put(p->bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
++	}
++	destroy_swap_extents(p);
++	swap_cgroup_swapoff(p->type);
++	spin_lock(&swap_lock);
++	p->swap_file = NULL;
++	p->flags = 0;
++	spin_unlock(&swap_lock);
++	vfree(swap_map);
++	vfree(cluster_info);
++	if (swap_file) {
++		if (inode && S_ISREG(inode->i_mode)) {
++			inode_unlock(inode);
++			inode = NULL;
++		}
++		filp_close(swap_file, NULL);
++	}
++out:
++	if (page && !IS_ERR(page)) {
++		kunmap(page);
++		put_page(page);
++	}
++	if (name)
++		putname(name);
++	if (inode && S_ISREG(inode->i_mode))
++		inode_unlock(inode);
++	if (!error)
++		enable_swap_slots_cache();
++	return error;
++}
++
++
+ SYSCALL_DEFINE2(hpswapon, const char __user *, specialfile, int, swap_flags)
+ {
+ 	struct swap_info_struct *p;
+-- 
+2.33.1.windows.1
+

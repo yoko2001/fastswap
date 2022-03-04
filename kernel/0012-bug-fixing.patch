@@ -1,0 +1,106 @@
+From 80cb23ddee8fbff427e1eeb6d5edc1aeb9c254be Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Fri, 4 Mar 2022 18:54:36 +0800
+Subject: [PATCH 2/2] bug fixing
+
+---
+ mm/swapfile.c | 60 ++++++++-------------------------------------------
+ 1 file changed, 9 insertions(+), 51 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 5064d512..f40aeba4 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -3252,23 +3252,14 @@ out:
+ 	return error;
+ }
+ 
+-static int turn_swap_to_hpswap(struct swap_info_struct *p, int, swap_flags)
++static int turn_swap_to_hpswap(struct swap_info_struct *p)
+ {
+-	struct file *swap_file = NULL;
+-	struct address_space *mapping;
+-	int prio;
+ 	int error;
+-	sector_t span;
+-	unsigned long maxpages;
+-	unsigned char *swap_map = NULL;
+-	struct swap_cluster_info *cluster_info = NULL;
+-	struct page *page = NULL;
+-	struct inode *inode = NULL;
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+-	INIT_WORK(&p->discard_work, swap_discard_work);	//TODO: what's this
++	//INIT_WORK(&p->discard_work, swap_discard_work);	//TODO: what's this
+ 
+ 	//name info is already set
+ 
+@@ -3310,56 +3301,23 @@ static int turn_swap_to_hpswap(struct swap_info_struct *p, int, swap_flags)
+ 		pr_err("init hpswap error");
+ 		goto bad_swap;
+ 	}
+-	pr_info("Adding %u [HUGEPAGE]swap on %s.  Priority:%d extents:%d across:%lluk %s%s%s%s%s\n",
++	pr_info("Found %u [HUGEPAGE]swap on %s.  Priority:%d across:%lluk %s%s%s%s\n",
+ 		p->maxhugepages, name->name, p->prio,
+-		nr_extents, (unsigned long long)span<<(PAGE_SHIFT-10),
+ 		(p->flags & SWP_SOLIDSTATE) ? "SS" : "",
+ 		(p->flags & SWP_DISCARDABLE) ? "D" : "",
+ 		(p->flags & SWP_AREA_DISCARD) ? "s" : "",
+-		(p->flags & SWP_PAGE_DISCARD) ? "c" : "",
+-		(frontswap_map) ? "FS" : "");
++		(p->flags & SWP_PAGE_DISCARD) ? "c" : "");
+ 
+ 	mutex_unlock(&swapon_mutex);
+-	atomic_inc(&proc_poll_event);
+-	wake_up_interruptible(&proc_poll_wait);
+-
+-	if (S_ISREG(inode->i_mode))
+-		inode->i_flags |= S_SWAPFILE;
++	//atomic_inc(&proc_poll_event);
++	//wake_up_interruptible(&proc_poll_wait);
+ 	error = 0;
+ 	goto out;
+ bad_swap:
+-	free_percpu(p->percpu_cluster);
+-	p->percpu_cluster = NULL;
+-	if (inode && S_ISBLK(inode->i_mode) && p->bdev) {
+-		set_blocksize(p->bdev, p->old_block_size);
+-		blkdev_put(p->bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
+-	}
+-	destroy_swap_extents(p);
+-	swap_cgroup_swapoff(p->type);
+-	spin_lock(&swap_lock);
+-	p->swap_file = NULL;
+-	p->flags = 0;
+-	spin_unlock(&swap_lock);
+-	vfree(swap_map);
+-	vfree(cluster_info);
+-	if (swap_file) {
+-		if (inode && S_ISREG(inode->i_mode)) {
+-			inode_unlock(inode);
+-			inode = NULL;
+-		}
+-		filp_close(swap_file, NULL);
+-	}
++	return error;
+ out:
+-	if (page && !IS_ERR(page)) {
+-		kunmap(page);
+-		put_page(page);
+-	}
+-	if (name)
+-		putname(name);
+-	if (inode && S_ISREG(inode->i_mode))
+-		inode_unlock(inode);
+-	if (!error)
+-		enable_swap_slots_cache();
++	// if (!error)
++	// 	enable_swap_slots_cache();
+ 	return error;
+ }
+ 
+-- 
+2.33.1.windows.1
+
