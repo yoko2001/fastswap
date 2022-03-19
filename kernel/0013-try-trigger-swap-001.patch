@@ -1,0 +1,248 @@
+From ec781718007e28d517f5ea699199c16e1f3e969b Mon Sep 17 00:00:00 2001
+From: yoko2001 <1766649097@qq.com>
+Date: Sat, 19 Mar 2022 17:58:58 +0800
+Subject: [PATCH] try trigger swap 001
+
+---
+ include/linux/hugetlb.h |  6 +++--
+ mm/hugetlb.c            | 56 +++++++++++++++++++++++++++++++++++++----
+ mm/swap_state.c         | 15 ++++++-----
+ 3 files changed, 64 insertions(+), 13 deletions(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 74cb886d..924dd342 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -313,7 +313,8 @@ struct hstate {
+ 	unsigned int order;
+ 	unsigned long mask;
+ 	unsigned long max_huge_pages;
+-	unsigned long nr_huge_pages;
++	unsigned long nr_huge_pages;		//set by syscall
++	unsigned long nr_actual_huge_pages;	//real hugepage in mem
+ 	unsigned long free_huge_pages;
+ 	unsigned long resv_huge_pages;
+ 	unsigned long surplus_huge_pages;
+@@ -323,8 +324,9 @@ struct hstate {
+ 	struct list_head hugepage_swaplist;	
+ 	struct list_head hugepage_freelists[MAX_NUMNODES];
+ 	unsigned int nr_huge_pages_node[MAX_NUMNODES];
++	unsigned int nr_actual_huge_pages_node[MAX_NUMNODES];
+ 	unsigned int free_huge_pages_node[MAX_NUMNODES];
+-	unsigned int surplus_huge_pages_node[MAX_NUMNODES];
++	unsigned int surplus_huge_pages_node[MAX_NUMNODES];,
+ #ifdef CONFIG_CGROUP_HUGETLB
+ 	/* cgroup control files */
+ 	struct cftype cgroup_files[5];
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 60699bdd..bc7a788f 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -99,7 +99,7 @@ struct hugepage_subpool *hugepage_new_subpool(struct hstate *h, long max_hpages,
+ 
+ 	spin_lock_init(&spool->lock);
+ 	spool->count = 1;
+-	spool->max_hpages = max_hpages;
++	spool->max_hpages = max_hpages;	//max physical memory usage
+ 	spool->hstate = h;
+ 	spool->min_hpages = min_hpages;
+ 
+@@ -1388,6 +1388,42 @@ static struct page *alloc_fresh_huge_page_node(struct hstate *h, int nid)
+ 	return page;
+ }
+ 
++static int alloc_fresh_huge_page2(struct hstate *h, nodemask_t *nodes_allowed, int count)
++{
++	struct page *page;
++	int nr_nodes, node;
++	int ret = 0;
++
++	//fake allocate for the rest 50%
++	if (count < h->nr_huge_pages * 2){
++		for_each_node_mask_to_alloc(h, nr_nodes, node, nodes_allowed){
++			spin_lock(&hugetlb_lock);
++			h->nr_huge_pages++;
++			h->nr_huge_pages_node[node]++;
++			spin_unlock(&hugetlb_lock);	
++		}
++		ret = 1;
++	}
++	else{
++		for_each_node_mask_to_alloc(h, nr_nodes, node, nodes_allowed) {
++			page = alloc_fresh_huge_page_node(h, node);
++			if (page) {
++				ret = 1;
++				h->nr_actual_huge_pages_node[node] ++;
++				h->nr_actual_huge_pages++;
++				break;
++			}
++		}		
++	}
++
++	if (ret)
++		count_vm_event(HTLB_BUDDY_PGALLOC);
++	else
++		count_vm_event(HTLB_BUDDY_PGALLOC_FAIL);
++
++	return ret;
++}
++
+ static int alloc_fresh_huge_page(struct hstate *h, nodemask_t *nodes_allowed)
+ {
+ 	struct page *page;
+@@ -2019,6 +2055,8 @@ static long hugepage_subpool_swapout_pages(struct hstate *h,
+ 			continue;
+ 		// naive break out method
+ 		unsigned long vm_flags;
++
++		//?? what's the deference between page_reference & pte_reference?
+ 		refcount = page_referenced(page, 1, NULL, &vm_flags);
+ 
+ 		if (refcount){
+@@ -2036,7 +2074,7 @@ static long hugepage_subpool_swapout_pages(struct hstate *h,
+ 
+ 	//find a Page which has not that much ref, straight swapout, ASAP
+ 	int ret; 
+-	if (page && &page->lru != &h->hugepage_activelist){
++	if (page && (&page->lru != &h->hugepage_activelist)){
+ 		VM_BUG_ON(!PagePrivate(page));`	//assumes all are private page
+ 		//found a page to swap out
+ 		list_del(&page->lru);	//delete from activelist
+@@ -2071,6 +2109,7 @@ static long hugepage_subpool_swapout_pages(struct hstate *h,
+ 		int nid;
+ 		nid = page_to_nid(page);
+ 		list_move(&page->lru, &h->hugepage_freelists[nid]);
++		printk("page [%p]added to lru list, free_huge_pages %d => %d\n", page, h->free_huge_pages, h->free_huge_pages+1);
+ 		h->free_huge_pages++;
+ 		h->free_huge_pages_node[nid]++;
+ 	}
+@@ -2093,7 +2132,7 @@ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 	long gbl_chg;
+ 	int ret, idx;
+ 	struct hugetlb_cgroup *h_cg;
+-
++	printk("alloc_huge_page to addr: %p\n", addr);
+ 	idx = hstate_index(h);
+ 	/*
+ 	 * Examine the region/reserve map to determine if the process
+@@ -2115,6 +2154,7 @@ retry_after_swap:
+ 	if (map_chg || avoid_reserve) {
+ 		gbl_chg = hugepage_subpool_get_pages(spool, 1);
+ 		if (gbl_chg < 0) {
++			printk("hugepage_subpool_get_pages fail, try to swapout one hugepage\n");
+ 			if (hugepage_subpool_swapout_pages(h, vma, spool) == 0){
+ 				goto retry_after_swap;
+ 			}
+@@ -2396,7 +2436,7 @@ static unsigned long set_max_huge_pages(struct hstate *h, unsigned long count,
+ 						nodemask_t *nodes_allowed)
+ {
+ 	unsigned long min_count, ret;
+-
++	printk("set_max_huge_pages to %d\n", count);
+ 	if (hstate_is_gigantic(h) && !gigantic_page_supported())
+ 		return h->max_huge_pages;
+ 
+@@ -2431,7 +2471,7 @@ static unsigned long set_max_huge_pages(struct hstate *h, unsigned long count,
+ 		if (hstate_is_gigantic(h))
+ 			ret = alloc_fresh_gigantic_page(h, nodes_allowed);
+ 		else
+-			ret = alloc_fresh_huge_page(h, nodes_allowed);
++			ret = alloc_fresh_huge_page2(h, nodes_allowed, count);//alloc_fresh_huge_page(h, nodes_allowed);
+ 		spin_lock(&hugetlb_lock);
+ 		if (!ret)
+ 			goto out;
+@@ -2456,6 +2496,8 @@ static unsigned long set_max_huge_pages(struct hstate *h, unsigned long count,
+ 	 * and won't grow the pool anywhere else. Not until one of the
+ 	 * sysctls are changed, or the surplus pages go out of use.
+ 	 */
++	//calculate the minimum number of hp in mem
++	//that can satisfy all given resv_pages
+ 	min_count = h->resv_huge_pages + h->nr_huge_pages - h->free_huge_pages;
+ 	min_count = max(count, min_count);
+ 	try_to_free_low(h, min_count, nodes_allowed);
+@@ -2464,13 +2506,17 @@ static unsigned long set_max_huge_pages(struct hstate *h, unsigned long count,
+ 			break;
+ 		cond_resched_lock(&hugetlb_lock);
+ 	}
++	//we want count close to persistent_huge_pages
+ 	while (count < persistent_huge_pages(h)) {
+ 		if (!adjust_pool_surplus(h, nodes_allowed, 1))
++			//fail add surplus, break
+ 			break;
+ 	}
+ out:
+ 	ret = persistent_huge_pages(h);
+ 	spin_unlock(&hugetlb_lock);
++	printk("current hugepage: nr_huge_pages: %d ; nr_actual_huge_pages: %d, persistent_huge_pages: %d, surplus_hugepages %d\n",
++			h->nr_huge_pages, h->nr_actual_huge_pages, persistent_huge_pages(h), h->surplus_huge_pages);
+ 	return ret;
+ }
+ 
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index c7e087fd..53544eeb 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -229,8 +229,8 @@ int write_and_wait_hpswap(struct page *page, struct writeback_control *wbc, swp_
+ 	VM_BUG_ON_PAGE(PageSwapCache(page), page);
+ 	VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
+ 
+-	get_page(page);
+-	__SetPageSwapBacked(page);//SetPageSwapCache(page);
++	get_page(page);	//? what's the meaning of this, not to free this page?
++	__SetPageSwapBacked(page);//SetPageSwapCache(page);	
+ 	set_page_private(page, entry.val);
+ 	address_space = swap_address_space(entry);
+ 	spin_lock_irq(&address_space->tree_lock);
+@@ -251,7 +251,7 @@ int write_and_wait_hpswap(struct page *page, struct writeback_control *wbc, swp_
+ 		put_page(page);
+ 		return error;
+ 	}	
+-	
++	printfk("write_and_wait_hpswap calls swap_writehgpage for page: %p\n", page);
+ 	swap_writehgpage(page, wbc);
+ 	lock_page(page);
+ 	wait_on_page_writeback(page);	
+@@ -270,13 +270,14 @@ int add_to_hpswap(struct page *page, struct list_head *list)
+ {
+ 	swp_entry_t entry;
+ 	int err;
+-
++	printk("add_to_hpswap(page=%p)\n", page);
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	VM_BUG_ON_PAGE(!PageUptodate(page), page);
+ 
+ 	entry = get_hpswap_page();
+ 	if (!entry.val)
+ 		return 0;
++	printk("add_to_hpswap(page=%p) got hpswap entry\n", page);
+ 
+ 	//I didn't chg this part, doesn't know if this will break the page
+ 	if (mem_cgroup_try_charge_swap(page, entry)) {
+@@ -285,12 +286,14 @@ int add_to_hpswap(struct page *page, struct list_head *list)
+ 		return 0;
+ 	}
+ 
+-	if (unlikely(PageTransHuge(page)))
++	if (unlikely(PageTransHuge(page))){
++		VM_BUG_ON(1);
+ 		//I guess we'll not enter this
+ 		if (unlikely(split_huge_page_to_list(page, list))) {
+ 			swapcache_free(entry);
+ 			return 0;
+ 		}
++	}
+ 
+ 	/*
+ 	 * Radix-tree node allocations from PF_MEMALLOC contexts could
+@@ -304,7 +307,7 @@ int add_to_hpswap(struct page *page, struct list_head *list)
+ 	struct writeback_control wbc = {
+ 		.sync_mode = WB_SYNC_NONE,
+ 	};
+-
++	printk("add_to_hpswap(page=%p) try write to swap called write_and_wait_hpswap\n", page)
+ 	err = write_and_wait_hpswap(page, &wbc, entry);
+ 	//page->private has been set to swap entry, so that we can use it to fill pte
+ 
+-- 
+2.33.1.windows.1
+
